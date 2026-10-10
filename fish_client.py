@@ -1,7 +1,9 @@
-"""Fish HTTP TTS：异步请求，生成 MP3，定期清理过期音频。"""
+"""Fish HTTP TTS：异步请求，生成 MP3/WAV，定期清理过期音频。"""
 
 import asyncio
+import io
 import time
+import wave
 from pathlib import Path
 from uuid import uuid4
 
@@ -36,6 +38,16 @@ def has_mp3_header(audio: bytes) -> bool:
     )
 
 
+def has_wav_audio(audio: bytes) -> bool:
+    """检查 PCM WAV 容器和首个采样帧，兼容流式 WAV 的未定长头。"""
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as source:
+            frame_size = source.getnchannels() * source.getsampwidth()
+            return source.getnframes() > 0 and len(source.readframes(1)) == frame_size
+    except (wave.Error, EOFError):
+        return False
+
+
 class FishClient:
     def __init__(self, config: dict, audio_dir: Path):
         self.config = config
@@ -56,6 +68,9 @@ class FishClient:
             raise FishError("语音内容不能为空。")
         if len(text) > int(self.config.get("max_text_length", 1000)):
             raise FishError("语音内容超过配置的字数上限。")
+        audio_format = str(self.config.get("audio_format", "mp3")).strip().lower()
+        if audio_format not in ("mp3", "wav"):
+            raise FishError("音频格式仅支持 mp3 或 wav，请检查配置。")
 
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession()
@@ -66,8 +81,7 @@ class FishClient:
         payload = {
             "text": text,
             "reference_id": str(self.config["reference_id"]).strip(),
-            "format": "mp3",
-            "mp3_bitrate": 128,
+            "format": audio_format,
             "normalize": True,
             "latency": "normal",
             "prosody": {
@@ -75,6 +89,8 @@ class FishClient:
                 "volume": float(self.config.get("volume", 0)),
             },
         }
+        if audio_format == "mp3":
+            payload["mp3_bitrate"] = 128
         endpoint = str(
             self.config.get("api_url", "https://api.fish.audio/v1/tts")
         ).strip()
@@ -94,23 +110,28 @@ class FishClient:
                 audio = await response.read()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise FishError("Fish 网络请求失败或超时。") from exc
-        if not has_mp3_header(audio):
-            raise FishError("Fish 返回的数据缺少有效的 MP3 帧头。")
+        valid_audio = (
+            has_mp3_header(audio) if audio_format == "mp3" else has_wav_audio(audio)
+        )
+        if not valid_audio:
+            raise FishError(f"Fish 返回的数据不符合 {audio_format.upper()} 音频格式。")
 
-        return await asyncio.to_thread(self._save_audio, audio)
+        return await asyncio.to_thread(self._save_audio, audio, audio_format)
 
-    def _save_audio(self, audio: bytes) -> Path:
+    def _save_audio(self, audio: bytes, audio_format: str) -> Path:
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         now = time.time()
         if now - self.last_cleanup > 3600:
             self.last_cleanup = now
-            for path in self.audio_dir.glob("fish_*.mp3"):
+            for path in self.audio_dir.glob("fish_*.*"):
+                if path.suffix not in (".mp3", ".wav"):
+                    continue
                 try:
                     if now - path.stat().st_mtime > 86400:
                         path.unlink(missing_ok=True)
                 except OSError:
                     continue
-        path = self.audio_dir / f"fish_{uuid4().hex}.mp3"
+        path = self.audio_dir / f"fish_{uuid4().hex}.{audio_format}"
         path.write_bytes(audio)
         return path.resolve()
 

@@ -34,6 +34,13 @@
       "s2.1-pro-free"
     ]
   },
+  "audio_format": {
+    "description": "音频输出格式",
+    "type": "string",
+    "default": "mp3",
+    "options": ["mp3", "wav"],
+    "hint": "Fish 返回的源音频格式。MP3 较小；WAV 为未压缩音频，可供 QQ 官方适配器转码。最终发送编码由 AstrBot 平台适配器处理。"
+  },
   "probability": {
     "description": "自动语音概率",
     "type": "float",

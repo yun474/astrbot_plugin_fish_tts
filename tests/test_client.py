@@ -1,10 +1,12 @@
 import asyncio
 import importlib
+import io
 import os
 import sys
 import tempfile
 import time
 import unittest
+import wave
 from pathlib import Path
 
 from aiohttp import web
@@ -13,6 +15,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
 client_module = importlib.import_module(f"{ROOT.name}.fish_client")
 FishClient, FishError = client_module.FishClient, client_module.FishError
+
+
+def wav_sample():
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(44100)
+        audio.writeframes(b"\0\0" * 441)
+    return buffer.getvalue()
 
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
@@ -99,6 +111,53 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         path = await self.client.synthesize("没有 ID3 的 MP3")
         self.assertEqual(path.read_bytes(), self.body)
 
+    async def test_wav_request_save_and_chunked_response(self):
+        self.config["audio_format"] = "wav"
+        self.body = wav_sample()
+        self.content_type = "audio/wav"
+        self.chunked = True
+        path = await self.client.synthesize("WAV 语音")
+        self.assertEqual(path.suffix, ".wav")
+        self.assertEqual(path.read_bytes(), self.body)
+        self.assertEqual(self.calls[0][1]["format"], "wav")
+        self.assertNotIn("mp3_bitrate", self.calls[0][1])
+        with wave.open(str(path), "rb") as audio:
+            self.assertEqual(audio.getnframes(), 441)
+
+    async def test_wav_accepts_streaming_unknown_length_header(self):
+        self.config["audio_format"] = "wav"
+        body = bytearray(wav_sample())
+        body[4:8] = b"\xff" * 4
+        body[40:44] = b"\xff" * 4
+        self.body = bytes(body)
+        self.content_type = "application/octet-stream"
+        path = await self.client.synthesize("流式 WAV")
+        self.assertEqual(path.read_bytes(), self.body)
+
+    async def test_wav_rejects_mp3_empty_or_malformed_container(self):
+        self.config["audio_format"] = "wav"
+        for body in (self.body, wav_sample()[:44], b"RIFF\0\0\0\0WAVE", b""):
+            with self.subTest(header=body[:12]):
+                self.body = body
+                with self.assertRaises(FishError):
+                    await self.client.synthesize("错误格式")
+        self.assertEqual(list(self.path.iterdir()), [])
+
+    async def test_invalid_format_rejected_before_http_request(self):
+        self.config["audio_format"] = "../../opus"
+        with self.assertRaisesRegex(FishError, "仅支持"):
+            await self.client.synthesize("错误配置")
+        self.assertEqual(self.calls, [])
+
+    async def test_format_switch_preserves_both_extensions(self):
+        mp3 = await self.client.synthesize("MP3")
+        self.config["audio_format"] = "wav"
+        self.body = wav_sample()
+        wav = await self.client.synthesize("WAV")
+        self.assertEqual(mp3.suffix, ".mp3")
+        self.assertEqual(wav.suffix, ".wav")
+        self.assertTrue(mp3.exists())
+
     async def test_other_formats_and_id3_only_are_rejected(self):
         for body in (
             b"RIFF" + b"\0" * 4 + b"WAVE" + b"\0" * 64,
@@ -156,12 +215,20 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         old.write_bytes(b"old")
         stale_time = time.time() - 90000
         os.utime(old, (stale_time, stale_time))
+        old_wav = self.path / "fish_old.wav"
+        old_wav.write_bytes(wav_sample())
+        os.utime(old_wav, (stale_time, stale_time))
+        unrelated_format = self.path / "fish_keep.txt"
+        unrelated_format.write_text("keep", encoding="utf-8")
+        os.utime(unrelated_format, (stale_time, stale_time))
         recent = self.path / "fish_recent.mp3"
         recent.write_bytes(b"recent")
         unrelated = self.path / "other.mp3"
         unrelated.write_bytes(b"unrelated")
         await self.client.synthesize("hello")
         self.assertFalse(old.exists())
+        self.assertFalse(old_wav.exists())
+        self.assertTrue(unrelated_format.exists())
         self.assertTrue(recent.exists())
         self.assertTrue(unrelated.exists())
 
