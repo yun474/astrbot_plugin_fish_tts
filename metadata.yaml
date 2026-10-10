@@ -1,0 +1,7 @@
+name: astrbot_plugin_fish_tts
+display_name: Fish 语音
+desc: 唤醒时预选概率语音，让 LLM 生成 Fish 台词与声音标签，支持独立语音工具和可编辑提示词。
+version: v0.1.0
+author: yun474
+repo: https://github.com/yun474/astrbot_plugin_fish_tts
+astrbot_version: ">=4.5.7"
